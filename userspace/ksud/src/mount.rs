@@ -54,120 +54,140 @@ impl Drop for AutoMountExt4 {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-pub fn mount_ext4(source: impl AsRef<Path>, target: impl AsRef<Path>) -> anyhow::Result<()> {
+fn mount_ext4_modern(source: &Path, target: &Path) -> Result<()> {
+    println!("[modern] Start mounting ext4 from {:?} to {:?}", source, target);
+
     // Create and setup loop device
-    let new_loopback = setup_loop_device(&source)?;
-    let loop_path = new_loopback.path().ok_or(anyhow!("no loop"))?;
-
-    // Try modern mount method first, fall back to traditional if not supported
-    let result = mount_ext4_modern(&loop_path, &target);
-    if let Err(e) = result {
-        if is_enosys_error(&e) {
-            mount_ext4_traditional(&loop_path, &target)
-        } else {
-            Err(e)
-        }
-    } else {
-        result
-    }
-}
-
-fn setup_loop_device(source: impl AsRef<Path>) -> anyhow::Result<loopdev::LoopDevice> {
     let new_loopback = loopdev::LoopControl::open()?
         .next_free()
         .with_context(|| "Failed to alloc loop")?;
-
+    println!("[modern] Allocated loop device: {:?}", new_loopback.path());
     new_loopback
         .with()
         .attach(source)
-        .with_context(|| "Failed to attach loop")?;
+        .with_context(|| format!("Failed to attach loop device to {:?}", source))?;
 
-    Ok(new_loopback)
-}
+    let lo = new_loopback
+        .path()
+        .ok_or(anyhow!("no loop"))?;
+    println!("[modern] Attached loop device: {:?}", lo);
 
-fn mount_ext4_modern(source: impl AsRef<Path>, target: impl AsRef<Path>) -> anyhow::Result<()> {
+    // Try modern mount (fsopen)
     let fs = fsopen("ext4", FsOpenFlags::FSOPEN_CLOEXEC)?;
+    println!("[modern] fsopen succeeded");
     let fs_fd = fs.as_fd();
 
     // Configure mount source
-    fsconfig_set_string(fs_fd, "source", source.as_ref().to_str().ok_or(anyhow!("Invalid path"))?)?;
+    let src_str = lo.to_str().ok_or(anyhow!("Invalid loop path"))?;
+    println!("[modern] Configuring mount source: {}", src_str);
+    fsconfig_set_string(fs_fd, "source", src_str)?;
 
     // Create filesystem configuration
     fsconfig_create(fs_fd)?;
+    println!("[modern] fsconfig_create succeeded");
 
-    // Create mount point
+    // Create mount
     let mount = fsmount(fs_fd, FsMountFlags::FSMOUNT_CLOEXEC, MountAttrFlags::empty())?;
+    println!("[modern] fsmount succeeded");
 
     // Move mount to target location
+    println!("[modern] move_mount to {:?}", target);
     move_mount(
         mount.as_fd(),
         "",
         CWD,
-        target.as_ref(),
+        target,
         MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
     )?;
+
+    println!("[modern] mount_ext4_modern done");
+    Ok(())
+}
+unsafe fn mount_ext4_fallback(source: &Path, target: &Path) -> Result<()> {
+    println!("[fallback] Start mounting ext4 from {:?} to {:?}", source, target);
+
+    // 创建并设置环回设备(loop device)
+    let new_loopback = loopdev::LoopControl::open()?
+        .next_free()
+        .with_context(|| "Failed to alloc loop")?;
+    println!("[fallback] Allocated loop device: {:?}", new_loopback.path());
+
+    new_loopback
+        .with()
+        .attach(source)
+        .with_context(|| format!("Failed to attach loop device to {:?}", source))?;
+
+    let lo = new_loopback
+        .path()
+        .ok_or(anyhow!("no loop"))?;
+    println!("[fallback] Attached loop device: {:?}", lo);
+
+    let source_c = std::ffi::CString::new(lo.to_str().ok_or(anyhow!("Invalid source path"))?)?;
+    let target_c = std::ffi::CString::new(target.to_str().ok_or(anyhow!("Invalid target path"))?)?;
+    let fstype = std::ffi::CString::new("ext4")?;
+
+    // 确保目标目录存在
+    std::fs::create_dir_all(target)?;
+
+    // 使用传统mount系统调用，直接将环回设备挂载到 `target`
+    let ret = libc::mount(
+        source_c.as_ptr(),
+        target_c.as_ptr(),
+        fstype.as_ptr(),
+        0,
+        std::ptr::null(),
+    );
+
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        bail!("[fallback] mount failed: {}", err);
+    }
+
+    println!("[fallback] mount_ext4_fallback done: {} is now mounted on {}",
+             lo.to_string_lossy(),
+             target.to_string_lossy()
+    );
 
     Ok(())
 }
 
-fn mount_ext4_traditional(source: impl AsRef<Path>, target: impl AsRef<Path>) -> anyhow::Result<()> {
-    unsafe {
-        let source = CString::new(source.as_ref().to_str().ok_or(anyhow!("Invalid source path"))?)?;
-        let target = CString::new(target.as_ref().to_str().ok_or(anyhow!("Invalid target path"))?)?;
-        let fstype = CString::new("ext4")?;
+// Helper function to copy directory contents recursively
+fn copy_dir_contents(from: &Path, to: &Path) -> Result<()> {
+    if !to.exists() {
+        std::fs::create_dir_all(to)?;
+    }
 
-        // Create temporary mount point
-        let temp_mount_point = format!("{}_temp", target.as_ref().to_str().unwrap());
-        let temp_mount = CString::new(temp_mount_point.clone())?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let path = entry.path();
+        let dest_path = to.join(entry.file_name());
 
-        // Create temp directory
-        std::fs::create_dir_all(&temp_mount_point)?;
-
-        // Perform initial mount
-        let ret = libc::mount(
-            source.as_ptr(),
-            temp_mount.as_ptr(),
-            fstype.as_ptr(),
-            0,
-            std::ptr::null(),
-        );
-
-        let result = if ret == 0 {
-            // Bind mount to final location
-            let ret = libc::mount(
-                temp_mount.as_ptr(),
-                target.as_ptr(),
-                std::ptr::null(),
-                libc::MS_BIND | libc::MS_REC,
-                std::ptr::null(),
-            );
-
-            if ret == 0 {
-                Ok(())
-            } else {
-                bail!("bind mount failed: {}", std::io::Error::last_os_error())
-            }
+        if path.is_dir() {
+            copy_dir_contents(&path, &dest_path)?;
         } else {
-            bail!("mount failed: {}", std::io::Error::last_os_error())
-        };
-
-        // Cleanup
-        let _ = libc::umount(temp_mount.as_ptr());
-        let _ = std::fs::remove_dir(&temp_mount_point);
-
-        result
+            std::fs::copy(&path, &dest_path)?;
+        }
     }
-}
 
-fn is_enosys_error(err: &anyhow::Error) -> bool {
-    if let Some(raw_err) = err.root_cause().downcast_ref::<std::io::Error>() {
-        raw_err.raw_os_error() == Some(libc::ENOSYS)
+    Ok(())
+}
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn mount_ext4(source: impl AsRef<Path>, target: impl AsRef<Path>) -> anyhow::Result<()> {
+    let source = source.as_ref();
+    let target = target.as_ref();
+    println!("[mount_ext4] Attempting modern mount first");
+    let result = mount_ext4_modern(source, target);
+    if result.is_err() {
+        let err = result.err();
+        println!("[mount_ext4] Modern mount failed: {:?}", err);
+        // If ENOSYS occurs, fall back to the old method
+        println!("[mount_ext4] fsopen not supported, fallback to old method");
+        return unsafe { mount_ext4_fallback(source, target) };
     } else {
-        false
+        println!("[mount_ext4] Modern mount succeeded");
+        Ok(())
     }
 }
-
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn umount_dir(src: impl AsRef<Path>) -> Result<()> {
     unmount(src.as_ref(), UnmountFlags::empty())
