@@ -1,3 +1,4 @@
+use std::ffi::CString;
 use anyhow::{anyhow, bail, Ok, Result};
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -54,20 +55,51 @@ impl Drop for AutoMountExt4 {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub fn mount_ext4(source: impl AsRef<Path>, target: impl AsRef<Path>) -> Result<()> {
+pub fn mount_ext4(source: impl AsRef<Path>, target: impl AsRef<Path>) -> anyhow::Result<()> {
+    // Create and setup loop device
+    let new_loopback = setup_loop_device(&source)?;
+    let loop_path = new_loopback.path().ok_or(anyhow!("no loop"))?;
+
+    // Try modern mount method first, fall back to traditional if not supported
+    let result = mount_ext4_modern(&loop_path, &target);
+    if let Err(e) = result {
+        if is_enosys_error(&e) {
+            mount_ext4_traditional(&loop_path, &target)
+        } else {
+            Err(e)
+        }
+    } else {
+        result
+    }
+}
+
+fn setup_loop_device(source: impl AsRef<Path>) -> anyhow::Result<loopdev::LoopDevice> {
     let new_loopback = loopdev::LoopControl::open()?
         .next_free()
         .with_context(|| "Failed to alloc loop")?;
+
     new_loopback
         .with()
         .attach(source)
         .with_context(|| "Failed to attach loop")?;
-    let lo = new_loopback.path().ok_or(anyhow!("no loop"))?;
+
+    Ok(new_loopback)
+}
+
+fn mount_ext4_modern(source: impl AsRef<Path>, target: impl AsRef<Path>) -> anyhow::Result<()> {
     let fs = fsopen("ext4", FsOpenFlags::FSOPEN_CLOEXEC)?;
-    let fs = fs.as_fd();
-    fsconfig_set_string(fs, "source", lo)?;
-    fsconfig_create(fs)?;
-    let mount = fsmount(fs, FsMountFlags::FSMOUNT_CLOEXEC, MountAttrFlags::empty())?;
+    let fs_fd = fs.as_fd();
+
+    // Configure mount source
+    fsconfig_set_string(fs_fd, "source", source.as_ref().to_str().ok_or(anyhow!("Invalid path"))?)?;
+
+    // Create filesystem configuration
+    fsconfig_create(fs_fd)?;
+
+    // Create mount point
+    let mount = fsmount(fs_fd, FsMountFlags::FSMOUNT_CLOEXEC, MountAttrFlags::empty())?;
+
+    // Move mount to target location
     move_mount(
         mount.as_fd(),
         "",
@@ -75,7 +107,65 @@ pub fn mount_ext4(source: impl AsRef<Path>, target: impl AsRef<Path>) -> Result<
         target.as_ref(),
         MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
     )?;
+
     Ok(())
+}
+
+fn mount_ext4_traditional(source: impl AsRef<Path>, target: impl AsRef<Path>) -> anyhow::Result<()> {
+    unsafe {
+        let source = CString::new(source.as_ref().to_str().ok_or(anyhow!("Invalid source path"))?)?;
+        let target = CString::new(target.as_ref().to_str().ok_or(anyhow!("Invalid target path"))?)?;
+        let fstype = CString::new("ext4")?;
+
+        // Create temporary mount point
+        let temp_mount_point = format!("{}_temp", target.as_ref().to_str().unwrap());
+        let temp_mount = CString::new(temp_mount_point.clone())?;
+
+        // Create temp directory
+        std::fs::create_dir_all(&temp_mount_point)?;
+
+        // Perform initial mount
+        let ret = libc::mount(
+            source.as_ptr(),
+            temp_mount.as_ptr(),
+            fstype.as_ptr(),
+            0,
+            std::ptr::null(),
+        );
+
+        let result = if ret == 0 {
+            // Bind mount to final location
+            let ret = libc::mount(
+                temp_mount.as_ptr(),
+                target.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND | libc::MS_REC,
+                std::ptr::null(),
+            );
+
+            if ret == 0 {
+                Ok(())
+            } else {
+                bail!("bind mount failed: {}", std::io::Error::last_os_error())
+            }
+        } else {
+            bail!("mount failed: {}", std::io::Error::last_os_error())
+        };
+
+        // Cleanup
+        let _ = libc::umount(temp_mount.as_ptr());
+        let _ = std::fs::remove_dir(&temp_mount_point);
+
+        result
+    }
+}
+
+fn is_enosys_error(err: &anyhow::Error) -> bool {
+    if let Some(raw_err) = err.root_cause().downcast_ref::<std::io::Error>() {
+        raw_err.raw_os_error() == Some(libc::ENOSYS)
+    } else {
+        false
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
